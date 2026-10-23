@@ -1,0 +1,36 @@
+# =============================================================================
+# ShareSphere .gitignore
+# =============================================================================
+
+# Databases & Backups (CRITICAL: Never commit database or backup files)
+sharesphere.db
+sharesphere_backup.db
+*.db
+*.sqlite
+*.sqlite3
+
+# Python Virtual Environments
+venv/
+.venv/
+env/
+ENV/
+
+# Secrets, Environment & Streamlit Config
+.env
+.env.*
+.streamlit/secrets.toml
+.streamlit/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyd
+
+# Testing & Scratch Files
+scratch/
+
+# Operating System Metadata
+.DS_Store
+Thumbs.db
+desktop.ini
