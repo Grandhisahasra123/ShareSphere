@@ -8,6 +8,13 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
+from db_backend import (
+    get_db_connection,
+    init_database,
+    is_postgres,
+    DBIntegrityError,
+    DBError,
+)
 
 st.set_page_config(
     page_title="ShareSphere | Campus Item Sharing",
@@ -195,141 +202,8 @@ RETURN_DISPUTED = "Disputed"
 
 # ---------------------------------------------------------
 # Database Helpers & Idempotent Schema Migration
+# (Managed by db_backend supporting Supabase PostgreSQL & SQLite)
 # ---------------------------------------------------------
-def get_db_connection():
-    connection = sqlite3.connect(DB_PATH)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA foreign_keys = ON")
-    return connection
-
-
-def init_database():
-    connection = get_db_connection()
-    # 1. Students table
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS students (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            email TEXT NOT NULL UNIQUE,
-            password_salt BLOB NOT NULL,
-            password_hash BLOB NOT NULL
-        )
-        """
-    )
-
-    # 2. Items table
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS items (
-            id TEXT PRIMARY KEY,
-            name TEXT NOT NULL,
-            description TEXT NOT NULL,
-            fee_type TEXT NOT NULL,
-            fee_amount REAL NOT NULL,
-            deposit REAL NOT NULL,
-            estimated_price REAL NOT NULL DEFAULT 0,
-            owner_student_id INTEGER NOT NULL,
-            created_at TEXT NOT NULL,
-            currently_borrowed INTEGER NOT NULL DEFAULT 0,
-            FOREIGN KEY (owner_student_id) REFERENCES students (id)
-        )
-        """
-    )
-    item_cols = [c["name"] for c in connection.execute("PRAGMA table_info(items)").fetchall()]
-    if "estimated_price" not in item_cols:
-        connection.execute("ALTER TABLE items ADD COLUMN estimated_price REAL NOT NULL DEFAULT 0")
-    if "currently_borrowed" not in item_cols:
-        connection.execute("ALTER TABLE items ADD COLUMN currently_borrowed INTEGER NOT NULL DEFAULT 0")
-
-    # 3. Borrowing requests table
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS borrowing_requests (
-            id TEXT PRIMARY KEY,
-            item_id TEXT NOT NULL,
-            borrower_student_id INTEGER NOT NULL,
-            owner_student_id INTEGER NOT NULL,
-            requested_days INTEGER NOT NULL,
-            borrowing_fee REAL NOT NULL,
-            refundable_deposit REAL NOT NULL,
-            status TEXT NOT NULL,
-            created_at TEXT NOT NULL,
-            payment_status TEXT NOT NULL DEFAULT 'Unpaid',
-            terms_accepted_at TEXT,
-            paid_at TEXT,
-            return_requested_at TEXT,
-            return_condition TEXT,
-            damage_notes TEXT,
-            damage_deduction REAL DEFAULT 0.0,
-            borrower_response TEXT,
-            refund_amount REAL DEFAULT 0.0,
-            refunded_at TEXT,
-            dispute_reason TEXT,
-            FOREIGN KEY (item_id) REFERENCES items (id),
-            FOREIGN KEY (borrower_student_id) REFERENCES students (id),
-            FOREIGN KEY (owner_student_id) REFERENCES students (id)
-        )
-        """
-    )
-    req_cols = [c["name"] for c in connection.execute("PRAGMA table_info(borrowing_requests)").fetchall()]
-    safe_new_cols = [
-        ("payment_status", "TEXT NOT NULL DEFAULT 'Unpaid'"),
-        ("terms_accepted_at", "TEXT"),
-        ("paid_at", "TEXT"),
-        ("return_requested_at", "TEXT"),
-        ("return_condition", "TEXT"),
-        ("damage_notes", "TEXT"),
-        ("damage_deduction", "REAL DEFAULT 0.0"),
-        ("borrower_response", "TEXT"),
-        ("refund_amount", "REAL DEFAULT 0.0"),
-        ("refunded_at", "TEXT"),
-        ("dispute_reason", "TEXT"),
-    ]
-    for col_name, col_def in safe_new_cols:
-        if col_name not in req_cols:
-            connection.execute(f"ALTER TABLE borrowing_requests ADD COLUMN {col_name} {col_def}")
-
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uniq_pending_borrower_item
-        ON borrowing_requests (item_id, borrower_student_id)
-        WHERE status = 'Pending'
-        """
-    )
-
-    # 4. Demo payments table (separate tracking of demo transactions & refunds)
-    connection.execute(
-        """
-        CREATE TABLE IF NOT EXISTS demo_payments (
-            id TEXT PRIMARY KEY,
-            request_id TEXT NOT NULL,
-            borrower_student_id INTEGER NOT NULL,
-            owner_student_id INTEGER NOT NULL,
-            borrowing_fee REAL NOT NULL,
-            refundable_deposit REAL NOT NULL,
-            total_paid REAL NOT NULL,
-            payment_type TEXT NOT NULL DEFAULT 'Demo Payment',
-            payment_status TEXT NOT NULL DEFAULT 'Completed',
-            paid_at TEXT NOT NULL,
-            refund_amount REAL DEFAULT 0.0,
-            refund_status TEXT NOT NULL DEFAULT 'Not Refunded',
-            refunded_at TEXT,
-            refund_notes TEXT,
-            FOREIGN KEY (request_id) REFERENCES borrowing_requests (id),
-            FOREIGN KEY (borrower_student_id) REFERENCES students (id),
-            FOREIGN KEY (owner_student_id) REFERENCES students (id)
-        )
-        """
-    )
-    connection.execute(
-        """
-        CREATE UNIQUE INDEX IF NOT EXISTS uniq_demo_payment_request
-        ON demo_payments (request_id)
-        """
-    )
-    connection.commit()
-    connection.close()
 
 
 # ---------------------------------------------------------
@@ -349,6 +223,8 @@ def hash_password(password):
 
 
 def verify_password(password, salt, stored_hash):
+    salt = bytes(salt) if isinstance(salt, memoryview) else salt
+    stored_hash = bytes(stored_hash) if isinstance(stored_hash, memoryview) else stored_hash
     check_hash = hashlib.scrypt(
         password.encode("utf-8"),
         salt=salt,
@@ -453,7 +329,7 @@ def register_student():
             (name, email, salt, password_hash),
         )
         connection.commit()
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         st.session_state.auth_errors = [
             "That email is already registered. Try logging in instead."
         ]
@@ -823,7 +699,7 @@ def create_borrowing_request(item_id, days):
         )
         connection.commit()
         st.toast("Borrowing request sent to owner!", icon="✅")
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         st.toast("A pending request for this item already exists.", icon="⚠️")
     finally:
         connection.close()
@@ -881,7 +757,7 @@ def accept_borrowing_request(request_id):
         )
         connection.execute("COMMIT")
         st.toast("Request accepted. Borrower notified to pay demo fee & deposit.", icon="✅")
-    except sqlite3.Error:
+    except DBError:
         connection.execute("ROLLBACK")
         st.toast("Could not accept request. Please try again.", icon="❌")
     finally:
@@ -1007,7 +883,7 @@ def cancel_borrowing_request(request_id):
 
         connection.execute("ROLLBACK")
         st.toast("This request cannot be cancelled in its current state.", icon="⚠️")
-    except sqlite3.Error:
+    except DBError:
         connection.execute("ROLLBACK")
         st.toast("Failed to cancel request. Please try again.", icon="❌")
     finally:
@@ -1097,7 +973,7 @@ def execute_demo_payment(request_id):
         connection.execute("COMMIT")
         st.toast(f"Demo Payment of {format_rupees(total_paid)} successful! Loan activated.", icon="🎉")
         return True, "Success"
-    except sqlite3.Error as e:
+    except DBError as e:
         connection.execute("ROLLBACK")
         return False, f"Database error: {str(e)}"
     finally:
@@ -1183,7 +1059,7 @@ def confirm_safe_return(request_id):
         )
         connection.execute("COMMIT")
         st.toast(f"Item returned safely. Full deposit of {format_rupees(deposit_refund)} demo-refunded!", icon="✅")
-    except sqlite3.Error:
+    except DBError:
         connection.execute("ROLLBACK")
         st.toast("Could not complete return. Please try again.", icon="❌")
     finally:
@@ -1283,7 +1159,7 @@ def borrower_respond_to_damage(request_id, accept_claim, response_notes=""):
             )
             connection.execute("COMMIT")
             st.toast("Dispute evidence submitted for owner review.", icon="📝")
-    except sqlite3.Error:
+    except DBError:
         connection.execute("ROLLBACK")
         st.toast("Action could not be saved.", icon="❌")
     finally:
@@ -1333,7 +1209,7 @@ def resolve_dispute(request_id, agreed_refund, resolution_notes):
         connection.execute("UPDATE items SET currently_borrowed = 0 WHERE id = ?", (req["item_id"],))
         connection.execute("COMMIT")
         st.toast(f"Dispute resolved. {format_rupees(agreed_refund)} demo-refunded.", icon="✅")
-    except sqlite3.Error:
+    except DBError:
         connection.execute("ROLLBACK")
         st.toast("Could not save resolution.", icon="❌")
     finally:
@@ -1368,7 +1244,7 @@ def remove_listed_item(item_id):
         connection.execute("DELETE FROM items WHERE id = ? AND owner_student_id = ?", (item_id, student["id"]))
         connection.commit()
         st.toast("Listing removed successfully.", icon="🗑️")
-    except sqlite3.IntegrityError:
+    except DBIntegrityError:
         st.toast("Cannot remove this item because it is referenced in borrowing records.", icon="⚠️")
     finally:
         connection.close()
